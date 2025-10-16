@@ -12,10 +12,10 @@ Environment:
 from __future__ import annotations
 
 import logging
-import os
 from typing import List, Optional
 
 from atlassian import Confluence
+import streamlit as st
 
 
 logger = logging.getLogger(__name__)
@@ -28,9 +28,9 @@ def _get_confluence_client() -> Confluence:
     Raises:
         RuntimeError: If required env vars are missing.
     """
-    url = os.getenv("CONFLUENCE_URL")
-    email = os.getenv("CONFLUENCE_EMAIL")
-    api_token = os.getenv("CONFLUENCE_API_TOKEN")
+    url = st.secrets.get("CONFLUENCE_URL")
+    email = st.secrets.get("CONFLUENCE_EMAIL")
+    api_token = st.secrets.get("CONFLUENCE_API_TOKEN")
     
     if not (url and email and api_token):
         raise RuntimeError(
@@ -104,7 +104,7 @@ def search_confluence(query: str, max_results: int = 10, space_key: Optional[str
                         space_name = space_data.get("name", "Unknown") if isinstance(space_data, dict) else "Unknown"
                         
                         # Extract URL
-                        base_url = os.getenv("CONFLUENCE_URL", "").rstrip("/")
+                        base_url = (st.secrets.get("CONFLUENCE_URL", "") or "").rstrip("/")
                         links = content.get("_links", {})
                         webui = links.get("webui", "")
                         url = f"{base_url}{webui}" if base_url and webui else ""
@@ -189,7 +189,7 @@ def _alternative_confluence_search(client: Confluence, query: str, max_results: 
                     
                     # Simple text matching
                     if query.lower() in title.lower() or query.lower() in body.lower():
-                        base_url = os.getenv("CONFLUENCE_URL", "").rstrip("/")
+                        base_url = (st.secrets.get("CONFLUENCE_URL", "") or "").rstrip("/")
                         webui = page.get("_links", {}).get("webui", "")
                         url = f"{base_url}{webui}" if base_url and webui else ""
                         

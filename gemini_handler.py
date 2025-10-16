@@ -11,11 +11,11 @@ Environment:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Optional, Sequence
 
 import google.generativeai as genai
+import streamlit as st
 
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def _configure_genai() -> None:
     """Configure the Google Generative AI client from environment."""
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
     genai.configure(api_key=api_key)
@@ -35,7 +35,7 @@ def _supported_models() -> list[str]:
     and common fallbacks. If SDK supports model listing, append discovered
     generateContent-capable models to the end.
     """
-    env_model = os.getenv("GEMINI_MODEL")
+    env_model = st.secrets.get("GEMINI_MODEL")
     if env_model:
         return [env_model]
 

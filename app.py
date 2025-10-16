@@ -7,13 +7,11 @@ Main application that combines Slack and Confluence search with Gemini AI.
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
 from datetime import datetime
 
 import streamlit as st
-from dotenv import load_dotenv
 
 from confluence_search import search_confluence
 from gemini_handler import ask_gemini
@@ -27,22 +25,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables (force override to pick up edits during reruns)
-load_dotenv(override=True)
+# Credentials are provided via st.secrets in Streamlit Cloud/local
 
 
 def _validate_env() -> List[str]:
     """Return a list of missing required environment variables."""
     missing = []
-    if not os.getenv("SLACK_USER_TOKEN"):
+    if not st.secrets.get("SLACK_USER_TOKEN"):
         missing.append("SLACK_USER_TOKEN")
-    if not os.getenv("CONFLUENCE_URL"):
+    if not st.secrets.get("CONFLUENCE_URL"):
         missing.append("CONFLUENCE_URL")
-    if not os.getenv("CONFLUENCE_EMAIL"):
+    if not st.secrets.get("CONFLUENCE_EMAIL"):
         missing.append("CONFLUENCE_EMAIL")
-    if not os.getenv("CONFLUENCE_API_TOKEN"):
+    if not st.secrets.get("CONFLUENCE_API_TOKEN"):
         missing.append("CONFLUENCE_API_TOKEN")
-    if not os.getenv("GEMINI_API_KEY"):
+    if not st.secrets.get("GEMINI_API_KEY"):
         missing.append("GEMINI_API_KEY")
     return missing
 

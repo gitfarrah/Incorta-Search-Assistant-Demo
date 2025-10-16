@@ -16,12 +16,12 @@ Notes:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Dict, List, Optional
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+import streamlit as st
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ def _get_slack_client() -> WebClient:
     Raises:
         RuntimeError: If SLACK_USER_TOKEN is not provided.
     """
-    token = os.getenv("SLACK_USER_TOKEN")
+    token = st.secrets.get("SLACK_USER_TOKEN")
     if not token:
         raise RuntimeError(
             "Missing SLACK_USER_TOKEN environment variable (must be a user xoxp- token)."
