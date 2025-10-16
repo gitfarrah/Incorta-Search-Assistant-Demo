@@ -1,5 +1,0 @@
-streamlit==1.38.0
-slack_sdk==3.33.2
-atlassian-python-api==3.41.16
-google-generativeai==0.7.2
-pytz==2024.2
