@@ -1,18 +1,3 @@
-"""
-Slack search module.
-
-Responsible for querying Slack's search.messages API and returning a
-normalized list of message dictionaries that are convenient to render and
-send as context to LLMs.
-
-Environment:
-- SLACK_USER_TOKEN: xoxp- token impersonating a user (required)
-
-Notes:
-- Uses user token (not bot).
-- Caches userId->username lookups to minimize API calls.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -28,12 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_slack_client() -> WebClient:
-    """
-    Construct a Slack WebClient using the SLACK_USER_TOKEN from env.
-
-    Raises:
-        RuntimeError: If SLACK_USER_TOKEN is not provided.
-    """
+   
     token = st.secrets.get("SLACK_USER_TOKEN")
     if not token:
         raise RuntimeError(
@@ -43,11 +23,7 @@ def _get_slack_client() -> WebClient:
 
 
 def _resolve_username(client: WebClient, user_id: Optional[str], cache: Dict[str, str]) -> str:
-    """
-    Resolve a Slack user ID to a human-readable username, with simple caching.
-
-    If user_id is None (e.g., message posted by an app/bot), returns "Unknown".
-    """
+   
     if not user_id:
         return "Unknown"
     if user_id in cache:
@@ -64,12 +40,7 @@ def _resolve_username(client: WebClient, user_id: Optional[str], cache: Dict[str
 
 
 def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]:
-    """
-    Resolve a channel name (with or without #) to its ID. If an ID is provided,
-    returns it as-is.
-
-    Searches across public and private channels with pagination.
-    """
+    
     if not channel_name_or_id:
         return None
 
@@ -105,16 +76,7 @@ def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]
 
 
 def _get_all_channels(client: WebClient, limit: int = 20) -> List[str]:
-    """
-    Get a list of all accessible channel IDs (public and private).
-    
-    Args:
-        client: Slack WebClient instance
-        limit: Maximum number of channels to return
-    
-    Returns:
-        List of channel IDs
-    """
+   
     channel_ids = []
     try:
         next_cursor: Optional[str] = None
@@ -152,21 +114,7 @@ def search_slack_recent(
     max_results: int = 10,
     max_age_hours: int = 72
 ) -> List[dict]:
-    """
-    Fetch recent messages from Slack channels and filter by relevance.
     
-    This bypasses Slack's search indexing delays and gets the latest messages.
-    If no channel is specified, searches across all accessible channels.
-    
-    Args:
-        channel_name: Slack channel name (with or without # prefix), or empty string for all channels
-        query: Search query to filter messages for relevance
-        max_results: Maximum number of relevant messages to return
-        max_age_hours: Only consider messages from the last N hours (default 72)
-    
-    Returns:
-        List of dictionaries with keys: text, username, channel, ts, permalink
-    """
     client = _get_slack_client()
     user_cache: Dict[str, str] = {}
     channel_name_cache: Dict[str, str] = {}  # Cache channel IDs to names
@@ -313,19 +261,7 @@ def search_slack_recent(
 
 
 def search_slack(query: str, max_results: int = 20) -> List[dict]:
-    """
-    Search Slack messages using the search.messages API.
-
-    Args:
-        query: Free-text search query.
-        max_results: Maximum number of messages to return (default 20).
-
-    Returns:
-        List of dictionaries with keys: text, username, channel, ts, permalink.
-
-    Raises:
-        RuntimeError: For missing credentials.
-    """
+    
     if not query or not query.strip():
         return []
 

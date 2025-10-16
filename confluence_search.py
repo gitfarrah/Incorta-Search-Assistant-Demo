@@ -1,14 +1,3 @@
-"""
-Confluence search module.
-
-Uses Atlassian Confluence REST API to perform searches and return normalized results.
-
-Environment:
-- CONFLUENCE_URL
-- CONFLUENCE_EMAIL
-- CONFLUENCE_API_TOKEN
-"""
-
 from __future__ import annotations
 
 import logging
@@ -22,12 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_confluence_client() -> Confluence:
-    """
-    Construct a Confluence client using env credentials.
-
-    Raises:
-        RuntimeError: If required env vars are missing.
-    """
+    
     url = st.secrets.get("CONFLUENCE_URL")
     email = st.secrets.get("CONFLUENCE_EMAIL")
     api_token = st.secrets.get("CONFLUENCE_API_TOKEN")
@@ -42,17 +26,7 @@ def _get_confluence_client() -> Confluence:
 
 
 def search_confluence(query: str, max_results: int = 10, space_key: Optional[str] = None) -> List[dict]:
-    """
-    Search Confluence using CQL or alternative methods.
-
-    Args:
-        query: Free-text search query.
-        max_results: Max number of pages to return (default 10).
-        space_key: Optional Confluence space key to restrict results.
-
-    Returns:
-        List of dictionaries with keys: title, excerpt, url, space, last_modified.
-    """
+    
     if not query or not query.strip():
         logger.warning("Empty query provided to search_confluence")
         return []
@@ -149,11 +123,7 @@ def search_confluence(query: str, max_results: int = 10, space_key: Optional[str
 
 
 def _alternative_confluence_search(client: Confluence, query: str, max_results: int) -> List[dict]:
-    """
-    Alternative search using get_all_pages_from_space.
     
-    This is a fallback when CQL search doesn't work.
-    """
     results: List[dict] = []
     
     try:

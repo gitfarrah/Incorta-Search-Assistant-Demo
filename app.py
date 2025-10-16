@@ -1,8 +1,3 @@
-"""
-Streamlit app for Slack + Confluence AI Search Assistant.
-
-Main application that combines Slack and Confluence search with Gemini AI.
-"""
 
 from __future__ import annotations
 
@@ -134,7 +129,6 @@ def main() -> None:
             help="If off, reuse last retrieved sources unless filters change.",
         )
 
-    # Chat UI - Simple single chat without history management
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = [
             {"role": "assistant", "content": "Hi! Ask me anything. I'll search Slack and Confluence, then summarize with sources."}
