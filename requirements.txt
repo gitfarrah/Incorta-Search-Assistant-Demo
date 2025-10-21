@@ -1,4 +1,0 @@
-streamlit
-slack-sdk
-google-generativeai
-atlassian-python-api
