@@ -50,8 +50,12 @@ def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]
     if channel_name.lower() in {"specific_channel_name", "channel_name", "none", ""}:
         return None
 
+    logger.info(f"Looking for channel: '{channel_name}'")
+    
     try:
         next_cursor: Optional[str] = None
+        found_channels = []
+        
         while True:
             response = client.conversations_list(
                 types="public_channel,private_channel",
@@ -59,15 +63,21 @@ def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]
                 cursor=next_cursor or None,
             )
             channels = response.get("channels", [])
+            
             for channel in channels:
-                if channel.get("name") == channel_name:
-                    return channel.get("id")
+                ch_name = channel.get("name", "")
+                ch_id = channel.get("id", "")
+                found_channels.append(f"{ch_name} ({ch_id})")
+                
+                if ch_name == channel_name:
+                    logger.info(f"Found channel '{channel_name}' with ID: {ch_id}")
+                    return ch_id
 
             next_cursor = (response.get("response_metadata") or {}).get("next_cursor") or ""
             if not next_cursor:
                 break
 
-        logger.warning(f"Channel '{channel_name}' not found")
+        logger.warning(f"Channel '{channel_name}' not found. Available channels: {found_channels[:10]}...")
         return None
 
     except SlackApiError as e:
@@ -455,23 +465,56 @@ def search_slack_optimized(
             logger.warning("No accessible channels found")
             return []
         
-        # Handle latest_message intent
+        # Handle latest_message intent or specific channel queries
         intent_type = (intent_data.get("intent") or "").lower()
-        if intent_type == "latest_message":
+        user_query_lower = user_query.lower()
+        
+        # Check if user is asking for a specific channel
+        is_specific_channel_query = any([
+            "channel" in user_query_lower and any(ch in user_query_lower for ch in ["incorta-kudos", "incorta_kudos", "kudos"]),
+            "in #" in user_query_lower,
+            "from #" in user_query_lower,
+            intent_type == "latest_message"
+        ])
+        
+        if is_specific_channel_query:
+            # For specific channel queries, search each channel individually
             latest_results: List[dict] = []
-            for channel_id in channel_ids:
+            
+            # If user mentioned a specific channel, prioritize that channel
+            target_channel = None
+            if "incorta-kudos" in user_query_lower or "incorta_kudos" in user_query_lower:
+                target_channel = "incorta-kudos"
+            elif "kudos" in user_query_lower:
+                target_channel = "kudos"
+            
+            # Search channels in order of priority
+            search_channels = []
+            if target_channel:
+                # Find the target channel first
+                for cid in channel_ids:
+                    try:
+                        info = client.conversations_info(channel=cid)
+                        ch_name = (info.get("channel", {}) or {}).get("name", "")
+                        if target_channel in ch_name.lower():
+                            search_channels.insert(0, cid)  # Prioritize target channel
+                            logger.info(f"Found target channel: {ch_name} ({cid})")
+                        else:
+                            search_channels.append(cid)
+                    except Exception:
+                        search_channels.append(cid)
+            else:
+                search_channels = channel_ids
+            
+            for channel_id in search_channels:
                 try:
-                    resp = client.conversations_history(channel=channel_id, limit=1, inclusive=True)
+                    # Get more messages for better results
+                    resp = client.conversations_history(channel=channel_id, limit=10, inclusive=True)
                     msgs = resp.get("messages", [])
                     if not msgs:
                         continue
-                    msg = msgs[0]
-                    username = _resolve_username(client, msg.get("user"), user_cache)
-                    try:
-                        permalink_resp = client.chat_getPermalink(channel=channel_id, message_ts=msg.get("ts"))
-                        permalink = permalink_resp.get("permalink", "")
-                    except Exception:
-                        permalink = ""
+                    
+                    # Get channel name
                     channel_name = channel_name_cache.get(channel_id)
                     if not channel_name:
                         try:
@@ -479,17 +522,50 @@ def search_slack_optimized(
                             channel_name = (info.get("channel", {}) or {}).get("name", channel_id)
                         except Exception:
                             channel_name = channel_id
-                    latest_results.append({
-                        "text": msg.get("text", ""),
-                        "username": username,
-                        "channel": channel_name,
-                        "ts": msg.get("ts"),
-                        "permalink": permalink,
-                    })
+                    
+                    # Process messages
+                    for msg in msgs:
+                        text = msg.get("text", "")
+                        if not text:
+                            continue
+                        
+                        # Calculate relevance for this specific query
+                        relevance_score = calculate_message_relevance(
+                            text, keywords, priority_terms, search_strategy
+                        )
+                        
+                        if relevance_score > 0:
+                            username = _resolve_username(client, msg.get("user"), user_cache)
+                            try:
+                                permalink_resp = client.chat_getPermalink(channel=channel_id, message_ts=msg.get("ts"))
+                                permalink = permalink_resp.get("permalink", "")
+                            except Exception:
+                                permalink = ""
+                            
+                            latest_results.append({
+                                "text": text,
+                                "username": username,
+                                "channel": channel_name,
+                                "ts": msg.get("ts"),
+                                "permalink": permalink,
+                                "relevance_score": relevance_score,
+                            })
+                    
+                    # If we found results in the target channel, prioritize them
+                    if target_channel and any(r["channel"].lower() == target_channel for r in latest_results):
+                        break
+                        
                 except SlackApiError as e:
-                    logger.warning(f"Failed to fetch latest from {channel_id}: {e}")
+                    logger.warning(f"Failed to fetch from {channel_id}: {e}")
                     continue
-            latest_results.sort(key=lambda x: float(x.get("ts", "0")), reverse=True)
+            
+            # Sort by relevance and timestamp
+            latest_results.sort(key=lambda x: (-x.get("relevance_score", 0), -float(x.get("ts", "0"))))
+            
+            # Clean up and return
+            for result in latest_results:
+                result.pop("relevance_score", None)
+            
             return latest_results[:max(1, int(limit or 1))]
 
         # Build optimized search query
@@ -529,6 +605,17 @@ def search_slack_optimized(
         logger.info(f"Optimized Slack query: {search_query}")
         logger.info(f"Search strategy: {search_strategy}")
         logger.info(f"Searching {len(channel_ids)} channels")
+        
+        # Log channel names for debugging
+        channel_names = []
+        for cid in channel_ids[:10]:  # Log first 10 channels
+            try:
+                info = client.conversations_info(channel=cid)
+                ch_data = info.get("channel", {})
+                channel_names.append(ch_data.get("name", cid))
+            except Exception:
+                channel_names.append(cid)
+        logger.info(f"Sample channels being searched: {channel_names}")
         
         # Try search API first
         all_results = []
