@@ -25,7 +25,7 @@ def _supported_models() -> list[str]:
         return [env_model]
 
     candidates: list[str] = [
-        "gemini-2.0-flash"
+        "gemini-2.0-flash",
         "gemini-2.0-flash-exp",
         "gemini-2.5-pro",
         "gemini-flash-2.5-pro",
