@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 import time
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from functools import lru_cache
+import threading
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -11,6 +14,12 @@ import streamlit as st
 
 
 logger = logging.getLogger(__name__)
+
+# Thread-safe caches
+_user_cache_lock = threading.Lock()
+_channel_cache_lock = threading.Lock()
+_user_cache: Dict[str, str] = {}
+_channel_info_cache: Dict[str, Dict] = {}
 
 
 def _get_slack_client() -> WebClient:
@@ -22,31 +31,60 @@ def _get_slack_client() -> WebClient:
     return WebClient(token=token)
 
 
-def _resolve_username(client: WebClient, user_id: Optional[str], cache: Dict[str, str]) -> str:
+def _resolve_username(client: WebClient, user_id: Optional[str]) -> str:
+    """Thread-safe username resolution with caching."""
     if not user_id:
         return "Unknown"
-    if user_id in cache:
-        return cache[user_id]
+    
+    with _user_cache_lock:
+        if user_id in _user_cache:
+            return _user_cache[user_id]
+    
     try:
         resp = client.users_info(user=user_id)
         profile = resp.get("user", {})
         username = profile.get("real_name") or profile.get("name") or user_id
-        cache[user_id] = username
+        
+        with _user_cache_lock:
+            _user_cache[user_id] = username
+        
         return username
     except SlackApiError as e:
         logger.warning("Failed to resolve username for %s: %s", user_id, e)
         return user_id
 
 
+def _get_channel_info(client: WebClient, channel_id: str) -> Dict:
+    """Thread-safe channel info retrieval with caching."""
+    with _channel_cache_lock:
+        if channel_id in _channel_info_cache:
+            return _channel_info_cache[channel_id]
+    
+    try:
+        info = client.conversations_info(channel=channel_id)
+        channel_data = info.get("channel", {})
+        
+        with _channel_cache_lock:
+            _channel_info_cache[channel_id] = channel_data
+        
+        return channel_data
+    except Exception as e:
+        logger.warning(f"Failed to get info for channel {channel_id}: {e}")
+        return {"id": channel_id, "name": channel_id}
+
+
 def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]:
+    """Resolve channel name to ID with caching."""
     if not channel_name_or_id:
         return None
 
+    # Already an ID
     if channel_name_or_id.startswith(("C", "G")) and " " not in channel_name_or_id:
         return channel_name_or_id
 
     channel_name = channel_name_or_id.lstrip('#')
-    # Early return for placeholder values to avoid wasted API calls
+    
+    # Skip placeholder values
     if channel_name.lower() in {"specific_channel_name", "channel_name", "none", ""}:
         return None
 
@@ -54,7 +92,6 @@ def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]
     
     try:
         next_cursor: Optional[str] = None
-        found_channels = []
         
         while True:
             response = client.conversations_list(
@@ -67,7 +104,6 @@ def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]
             for channel in channels:
                 ch_name = channel.get("name", "")
                 ch_id = channel.get("id", "")
-                found_channels.append(f"{ch_name} ({ch_id})")
                 
                 if ch_name == channel_name:
                     logger.info(f"Found channel '{channel_name}' with ID: {ch_id}")
@@ -77,7 +113,7 @@ def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]
             if not next_cursor:
                 break
 
-        logger.warning(f"Channel '{channel_name}' not found. Available channels: {found_channels[:10]}...")
+        logger.warning(f"Channel '{channel_name}' not found")
         return None
 
     except SlackApiError as e:
@@ -85,9 +121,10 @@ def _get_channel_id(client: WebClient, channel_name_or_id: str) -> Optional[str]
         return None
 
 
-def _get_all_channels(client: WebClient, limit: int = 200) -> List[str]:  # Increased limit significantly
-    """Get all accessible channels, excluding DMs."""
+def _get_all_channels_impl(client: WebClient, limit: int = 200) -> List[str]:
+    """Internal implementation of channel listing."""
     channel_ids = []
+    
     try:
         next_cursor: Optional[str] = None
         while len(channel_ids) < limit:
@@ -123,40 +160,60 @@ def _get_all_channels(client: WebClient, limit: int = 200) -> List[str]:  # Incr
         return []
 
 
+def _get_all_channels(limit: int = 200) -> List[str]:
+    """Get all accessible channels (cached per session)."""
+    # Use Streamlit session state for caching instead of lru_cache
+    if "slack_channel_list" not in st.session_state:
+        client = _get_slack_client()
+        st.session_state["slack_channel_list"] = _get_all_channels_impl(client, limit)
+    return st.session_state["slack_channel_list"]
+
+
+def _quick_relevance_check(text: str, keywords: List[str], priority_terms: List[str]) -> bool:
+    """Fast preliminary check before detailed scoring."""
+    if not text:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Must match at least one priority term if they exist
+    if priority_terms:
+        if not any(term.lower() in text_lower for term in priority_terms):
+            return False
+    
+    # Must match at least one keyword if they exist
+    if keywords:
+        if not any(kw.lower() in text_lower for kw in keywords):
+            return False
+    
+    return True
+
+
 def calculate_message_relevance(
     text: str,
     keywords: List[str],
     priority_terms: List[str],
     search_strategy: str = "fuzzy_match"
 ) -> float:
-    """
-    Calculate relevance score for a message based on keywords and strategy.
-    
-    Returns a score between 0 and 100.
-    """
+    """Calculate relevance score for a message (0-100)."""
     if not text:
         return 0.0
     
     text_lower = text.lower()
     score = 0.0
     
-    # Priority terms MUST match for exact_match strategy
-    if search_strategy == "exact_match" and priority_terms:
+    # Priority terms scoring
+    if priority_terms:
         priority_matches = sum(1 for term in priority_terms if term.lower() in text_lower)
-        if priority_matches == 0:
-            return 0.0  # No match on priority terms = not relevant
-        score += priority_matches * 20  # High weight for priority terms
-    elif priority_terms:
-        # For other strategies, priority terms still matter but aren't blockers
-        priority_matches = sum(1 for term in priority_terms if term.lower() in text_lower)
-        score += priority_matches * 15
+        if search_strategy == "exact_match" and priority_matches == 0:
+            return 0.0
+        score += priority_matches * 20
     
     # Keyword matching
     if keywords:
         keyword_matches = sum(1 for kw in keywords if kw.lower() in text_lower)
         score += keyword_matches * 5
         
-        # Bonus for keyword density
         if keyword_matches > 0:
             keyword_density = keyword_matches / len(keywords)
             score += keyword_density * 10
@@ -164,51 +221,127 @@ def calculate_message_relevance(
     # Exact phrase matching bonus
     for kw in keywords + priority_terms:
         if len(kw) > 3 and re.search(r'\b' + re.escape(kw.lower()) + r'\b', text_lower):
-            score += 3  # Bonus for word boundary matches
+            score += 3
     
-    # Technical pattern bonuses (version numbers, IDs, etc.)
+    # Technical patterns
     technical_patterns = [
-        r'\bv?\d+\.\d+(?:\.\d+)?(?:\.\d+)?\b',  # Version numbers
-        r'\b[A-Z]+-\d+\b',  # JIRA-style IDs
-        r'\b[A-Z]{2,}\d+\b',  # Product codes
+        r'\bv?\d+\.\d+(?:\.\d+)?(?:\.\d+)?\b',
+        r'\b[A-Z]+-\d+\b',
+        r'\b[A-Z]{2,}\d+\b',
     ]
     for pattern in technical_patterns:
         if re.search(pattern, text, re.IGNORECASE):
             score += 5
     
-    # Semantic context bonuses - look for related concepts and synonyms
+    # Semantic context bonuses
     semantic_bonuses = {
-        # Architecture and technical concepts
-        'architecture': ['design', 'structure', 'components', 'system', 'framework', 'infrastructure'],
+        'architecture': ['design', 'structure', 'components', 'system', 'framework'],
         'server': ['service', 'backend', 'api', 'endpoint', 'host'],
-        'integration': ['connect', 'link', 'bridge', 'interface', 'combine'],
-        'authentication': ['auth', 'login', 'security', 'access', 'credentials'],
-        'data': ['information', 'analytics', 'insights', 'metrics', 'database'],
-        
-        # Development and deployment
-        'development': ['dev', 'build', 'create', 'develop', 'coding'],
-        'deployment': ['deploy', 'launch', 'release', 'publish', 'go-live'],
-        'testing': ['test', 'qa', 'validate', 'verify', 'check'],
-        
-        # Business and project terms
-        'project': ['initiative', 'effort', 'work', 'task', 'undertaking'],
-        'team': ['group', 'crew', 'staff', 'members', 'people'],
-        'meeting': ['call', 'session', 'discussion', 'conversation', 'chat'],
+        'integration': ['connect', 'link', 'bridge', 'interface'],
+        'authentication': ['auth', 'login', 'security', 'access'],
+        'data': ['information', 'analytics', 'insights', 'metrics'],
+        'development': ['dev', 'build', 'create', 'develop'],
+        'deployment': ['deploy', 'launch', 'release', 'publish'],
+        'testing': ['test', 'qa', 'validate', 'verify'],
     }
     
-    # Apply semantic bonuses based on keyword context
     for primary_term, synonyms in semantic_bonuses.items():
         if any(primary_term in kw.lower() for kw in keywords + priority_terms):
             for synonym in synonyms:
                 if synonym in text_lower:
-                    score += 3  # Moderate bonus for semantic matches
+                    score += 2
     
-    # Length penalty for very short messages (likely noise)
+    # Length penalty for very short messages
     if len(text.strip()) < 20:
         score *= 0.5
     
-    # Cap score at 100
     return min(score, 100.0)
+
+
+def _search_channel_messages(
+    client: WebClient,
+    channel_id: str,
+    oldest: float,
+    keywords: List[str],
+    priority_terms: List[str],
+    search_strategy: str,
+    max_messages: int = 100,
+    target_results: int = 5
+) -> List[Dict]:
+    """Search a single channel for relevant messages."""
+    results = []
+    
+    try:
+        next_cursor: Optional[str] = None
+        total_fetched = 0
+        
+        while total_fetched < max_messages:
+            response = client.conversations_history(
+                channel=channel_id,
+                limit=min(100, max_messages - total_fetched),
+                cursor=next_cursor or None,
+                inclusive=True,
+                oldest=str(oldest) if oldest > 0 else None
+            )
+            
+            messages = response.get("messages", [])
+            if not messages:
+                break
+            
+            total_fetched += len(messages)
+            
+            for msg in messages:
+                text = msg.get("text", "")
+                if not text:
+                    continue
+                
+                # Skip system messages
+                if msg.get("subtype") in ["channel_join", "channel_leave", "channel_topic", "channel_purpose"]:
+                    continue
+                
+                # Quick relevance check
+                if not _quick_relevance_check(text, keywords, priority_terms):
+                    continue
+                
+                # Detailed scoring
+                relevance_score = calculate_message_relevance(
+                    text, keywords, priority_terms, search_strategy
+                )
+                
+                if relevance_score > 0:
+                    try:
+                        ts_val = float(msg.get("ts", "0"))
+                    except Exception:
+                        ts_val = 0.0
+                    
+                    results.append({
+                        "text": text,
+                        "user_id": msg.get("user"),
+                        "channel_id": channel_id,
+                        "ts": msg.get("ts"),
+                        "relevance": relevance_score,
+                        "_timestamp": ts_val,
+                    })
+                    
+                    # Early exit if we have enough highly relevant results
+                    if len(results) >= target_results * 2:
+                        high_quality_recent = [r for r in results[-5:] if r["relevance"] > 30]
+                        if len(high_quality_recent) >= 3:
+                            logger.info(f"Early exit from {channel_id} with {len(results)} results")
+                            return results
+            
+            next_cursor = (response.get("response_metadata") or {}).get("next_cursor") or ""
+            if not next_cursor:
+                break
+        
+        logger.info(f"Channel {channel_id}: Found {len(results)} relevant messages from {total_fetched} fetched")
+        
+    except SlackApiError as e:
+        logger.warning(f"Failed to fetch from channel {channel_id}: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error in channel {channel_id}: {e}")
+    
+    return results
 
 
 def search_slack_recent(
@@ -220,12 +353,9 @@ def search_slack_recent(
     priority_terms: Optional[List[str]] = None,
     search_strategy: str = "fuzzy_match"
 ) -> List[dict]:
-    """Enhanced recent message search with smart relevance scoring."""
+    """Enhanced recent message search with parallel processing."""
     
     client = _get_slack_client()
-    user_cache: Dict[str, str] = {}
-    channel_name_cache: Dict[str, str] = {}
-    
     keywords = keywords or []
     priority_terms = priority_terms or []
 
@@ -237,135 +367,109 @@ def search_slack_recent(
             channel_id = _get_channel_id(client, channel_name.strip())
             if channel_id:
                 channel_ids = [channel_id]
-                channel_name_cache[channel_id] = channel_name.strip().lstrip('#')
         else:
             logger.info("Searching all accessible channels")
-            channel_ids = _get_all_channels(client, limit=200)  # Search ALL accessible channels
-            
-            for cid in channel_ids:
-                try:
-                    info = client.conversations_info(channel=cid)
-                    ch_data = info.get("channel", {})
-                    channel_name_cache[cid] = ch_data.get("name", cid)
-                except Exception as e:
-                    logger.warning(f"Failed to get name for channel {cid}: {e}")
-                    channel_name_cache[cid] = cid
+            channel_ids = _get_all_channels(limit=200)
 
         if not channel_ids:
             logger.warning("No channels to search")
             return []
 
-        # Time window - only apply if not searching all history
+        # Calculate time window
         now_ts = time.time()
-        if max_age_hours > 0:  # 0 means search all history
-            oldest = now_ts - (max_age_hours * 3600)
-        else:
-            oldest = 0  # Search from beginning of time
+        oldest = now_ts - (max_age_hours * 3600) if max_age_hours > 0 else 0
 
-        # Collect messages
-        all_messages: List[dict] = []
+        # Parallel search across channels
+        all_messages: List[Dict] = []
         
-        for channel_id in channel_ids:
-            try:
-                next_cursor: Optional[str] = None
-                channel_messages: List[dict] = []
-                
-                while True:
-                    response = client.conversations_history(
-                        channel=channel_id,
-                        limit=100,
-                        cursor=next_cursor or None,
-                        inclusive=True,
-                        oldest=str(oldest)
-                    )
-                    batch = response.get("messages", [])
-                    if not batch:
-                        break
+        # Use thread pool for parallel channel searching
+        max_workers = min(20, len(channel_ids))  # Increased max_workers for faster processing
+        
+        # Use context manager properly
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            future_to_channel = {
+                executor.submit(
+                    _search_channel_messages,
+                    client,
+                    channel_id,
+                    oldest,
+                    keywords,
+                    priority_terms,
+                    search_strategy,
+                    100,
+                    max_results
+                ): channel_id
+                for channel_id in channel_ids
+            }
+            
+            # Wait for all futures with timeout=25s
+            done, not_done = wait(future_to_channel.keys(), timeout=25)
+            
+            # Cancel any remaining futures
+            for future in not_done:
+                future.cancel()
+            
+            # Collect results from completed futures
+            for future in done:
+                channel_id = future_to_channel[future]
+                try:
+                    channel_results = future.result(timeout=1)
+                    all_messages.extend(channel_results)
                     
-                    channel_messages.extend(batch)
-                    
-                    if len(channel_messages) >= 50:
-                        break
-                    
-                    next_cursor = (response.get("response_metadata") or {}).get("next_cursor") or ""
-                    if not next_cursor:
-                        break
-                
-                logger.info(f"Fetched {len(channel_messages)} messages from {channel_id}")
-                all_messages.extend([{**msg, "_channel_id": channel_id} for msg in channel_messages])
-                
-            except SlackApiError as e:
-                logger.warning(f"Failed to fetch from channel {channel_id}: {e}")
-                continue
+                    # Early exit if we have enough good results
+                    if len(all_messages) >= max_results * 3:
+                        high_quality = [m for m in all_messages if m["relevance"] > 40]
+                        if len(high_quality) >= max_results:
+                            logger.info(f"Early exit: Found {len(high_quality)} high-quality results")
+                            # Cancel remaining futures
+                            for f in future_to_channel.keys():
+                                if not f.done():
+                                    f.cancel()
+                            break
+                except Exception as e:
+                    logger.warning(f"Channel {channel_id} search failed: {e}")
+        
+        finally:
+            # Properly shutdown executor
+            executor.shutdown(wait=False)
 
-        logger.info(f"Total messages fetched: {len(all_messages)}")
+        logger.info(f"Total messages found: {len(all_messages)}")
 
         if not all_messages:
             return []
 
-        # Score and filter messages
-        relevant_messages: List[dict] = []
-
-        for msg in all_messages:
-            text = msg.get("text", "")
-            if not text:
-                continue
-            
-            # Skip system messages
-            if msg.get("subtype") in ["channel_join", "channel_leave", "channel_topic", "channel_purpose"]:
-                continue
-
-            try:
-                ts_val = float(msg.get("ts", "0"))
-            except Exception:
-                ts_val = 0.0
-            if ts_val < oldest:
-                continue
-
-            # Calculate relevance score
-            relevance_score = calculate_message_relevance(
-                text, keywords, priority_terms, search_strategy
-            )
-
-            if relevance_score > 0:
-                channel_id = msg.get("_channel_id", "unknown")
-                channel_display_name = channel_name_cache.get(channel_id, channel_id)
-                username = _resolve_username(client, msg.get("user"), user_cache)
-                
-                try:
-                    permalink_resp = client.chat_getPermalink(channel=channel_id, message_ts=msg.get("ts"))
-                    permalink = permalink_resp.get("permalink", "")
-                except Exception:
-                    permalink = ""
-
-                relevant_messages.append({
-                    "text": text,
-                    "username": username,
-                    "channel": channel_display_name,
-                    "ts": msg.get("ts"),
-                    "permalink": permalink,
-                    "relevance": relevance_score,
-                    "_timestamp": ts_val,
-                })
-
         # Sort by relevance then timestamp
-        relevant_messages.sort(key=lambda x: (-x.get("relevance", 0), -x.get("_timestamp", 0)))
+        all_messages.sort(key=lambda x: (-x.get("relevance", 0), -x.get("_timestamp", 0)))
 
-        # Clean and return top results
+        # Enrich and format results
         results: List[dict] = []
-        for item in relevant_messages[:max_results]:
-            item.pop("relevance", None)
-            item.pop("_timestamp", None)
-            results.append(item)
+        
+        for item in all_messages[:max_results]:
+            channel_id = item["channel_id"]
+            channel_info = _get_channel_info(client, channel_id)
+            channel_name = channel_info.get("name", channel_id)
+            username = _resolve_username(client, item.get("user_id"))
+            
+            try:
+                permalink_resp = client.chat_getPermalink(channel=channel_id, message_ts=item.get("ts"))
+                permalink = permalink_resp.get("permalink", "")
+            except Exception:
+                permalink = ""
+
+            results.append({
+                "text": item["text"],
+                "username": username,
+                "channel": channel_name,
+                "ts": item["ts"],
+                "permalink": permalink,
+            })
 
         logger.info(f"Returning {len(results)} relevant messages")
         return results
 
-    except SlackApiError as e:
-        logger.error(f"Slack API error: {e}")
-        return []
     except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
+        logger.exception(f"Unexpected error in search_slack_recent: {e}")
         return []
 
 
@@ -379,7 +483,6 @@ def search_slack(query: str, max_results: int = 20) -> List[dict]:
     collected: List[dict] = []
     page = 1
     per_page = 20
-    user_cache: Dict[str, str] = {}
 
     try:
         while len(collected) < max_results:
@@ -394,10 +497,7 @@ def search_slack(query: str, max_results: int = 20) -> List[dict]:
                 channel_name = (item.get("channel", {}) or {}).get("name", "unknown")
                 ts = item.get("ts") or (item.get("message", {}) or {}).get("ts")
                 permalink = item.get("permalink")
-
-                username = item.get("username")
-                if not username:
-                    username = _resolve_username(client, item.get("user"), user_cache)
+                username = item.get("username") or _resolve_username(client, item.get("user"))
 
                 collected.append({
                     "text": text,
@@ -428,11 +528,9 @@ def search_slack_optimized(
     intent_data: dict,
     user_query: str
 ) -> List[dict]:
-    """Optimized Slack search using enhanced intent analysis."""
+    """Optimized Slack search with adaptive strategies and improved fallback."""
     
     client = _get_slack_client()
-    user_cache: Dict[str, str] = {}
-    channel_name_cache: Dict[str, str] = {}
     
     slack_params = intent_data.get("slack_params", {})
     channels = slack_params.get("channels", "all")
@@ -440,223 +538,128 @@ def search_slack_optimized(
     keywords = slack_params.get("keywords", [])
     priority_terms = slack_params.get("priority_terms", [])
     limit = slack_params.get("limit", 10)
-    sort = slack_params.get("sort", "relevance")
     search_strategy = intent_data.get("search_strategy", "fuzzy_match")
+    min_results_threshold = 3  # Minimum results to avoid fallback
     
     try:
         # Determine channels
         channel_ids: List[str] = []
         
         if channels == "all":
-            channel_ids = _get_all_channels(client, limit=200)  # Search ALL accessible channels
+            channel_ids = _get_all_channels(limit=200)
         elif isinstance(channels, str):
             channel_id = _get_channel_id(client, channels)
             if channel_id:
                 channel_ids = [channel_id]
-                channel_name_cache[channel_id] = channels.lstrip('#')
         elif isinstance(channels, list):
             for channel_name in channels:
                 channel_id = _get_channel_id(client, channel_name)
                 if channel_id:
                     channel_ids.append(channel_id)
-                    channel_name_cache[channel_id] = channel_name.lstrip('#')
         
         if not channel_ids:
             logger.warning("No accessible channels found")
             return []
         
-        # Handle latest_message intent or specific channel queries
+        # Handle latest_message intent
         intent_type = (intent_data.get("intent") or "").lower()
         user_query_lower = user_query.lower()
         
-        # Check if user is asking for a specific channel
-        is_specific_channel_query = any([
-            "channel" in user_query_lower and any(ch in user_query_lower for ch in ["incorta-kudos", "incorta_kudos", "kudos"]),
-            "in #" in user_query_lower,
-            "from #" in user_query_lower,
-            intent_type == "latest_message"
-        ])
+        is_latest_query = (
+            intent_type == "latest_message" or
+            "latest" in user_query_lower or
+            "recent" in user_query_lower
+        )
         
-        if is_specific_channel_query:
-            # For specific channel queries, search each channel individually
-            latest_results: List[dict] = []
+        if is_latest_query:
+            # For latest messages, use adaptive time window starting recent
+            max_age_hours = 24 if time_range == "recent" else 168
+            results = search_slack_recent(
+                "",
+                user_query,
+                limit,
+                max_age_hours,
+                keywords,
+                priority_terms,
+                search_strategy
+            )
             
-            # If user mentioned a specific channel, prioritize that channel
-            target_channel = None
-            if "incorta-kudos" in user_query_lower or "incorta_kudos" in user_query_lower:
-                target_channel = "incorta-kudos"
-            elif "kudos" in user_query_lower:
-                target_channel = "kudos"
+            # If insufficient results, extend time window
+            if len(results) < min_results_threshold:
+                logger.info(f"Extending time window for latest query: {len(results)} < {min_results_threshold}")
+                extended_results = search_slack_recent(
+                    "",
+                    user_query,
+                    limit,
+                    max_age_hours * 2,  # Double the time window
+                    keywords,
+                    priority_terms,
+                    search_strategy
+                )
+                results = extended_results[:limit]  # Take up to limit
             
-            # Search channels in order of priority
-            search_channels = []
-            if target_channel:
-                # Find the target channel first
-                for cid in channel_ids:
-                    try:
-                        info = client.conversations_info(channel=cid)
-                        ch_name = (info.get("channel", {}) or {}).get("name", "")
-                        if target_channel in ch_name.lower():
-                            search_channels.insert(0, cid)  # Prioritize target channel
-                            logger.info(f"Found target channel: {ch_name} ({cid})")
-                        else:
-                            search_channels.append(cid)
-                    except Exception:
-                        search_channels.append(cid)
-            else:
-                search_channels = channel_ids
-            
-            for channel_id in search_channels:
-                try:
-                    # Get more messages for better results
-                    resp = client.conversations_history(channel=channel_id, limit=10, inclusive=True)
-                    msgs = resp.get("messages", [])
-                    if not msgs:
-                        continue
-                    
-                    # Get channel name
-                    channel_name = channel_name_cache.get(channel_id)
-                    if not channel_name:
-                        try:
-                            info = client.conversations_info(channel=channel_id)
-                            channel_name = (info.get("channel", {}) or {}).get("name", channel_id)
-                        except Exception:
-                            channel_name = channel_id
-                    
-                    # Process messages
-                    for msg in msgs:
-                        text = msg.get("text", "")
-                        if not text:
-                            continue
-                        
-                        # Calculate relevance for this specific query
-                        relevance_score = calculate_message_relevance(
-                            text, keywords, priority_terms, search_strategy
-                        )
-                        
-                        if relevance_score > 0:
-                            username = _resolve_username(client, msg.get("user"), user_cache)
-                            try:
-                                permalink_resp = client.chat_getPermalink(channel=channel_id, message_ts=msg.get("ts"))
-                                permalink = permalink_resp.get("permalink", "")
-                            except Exception:
-                                permalink = ""
-                            
-                            latest_results.append({
-                                "text": text,
-                                "username": username,
-                                "channel": channel_name,
-                                "ts": msg.get("ts"),
-                                "permalink": permalink,
-                                "relevance_score": relevance_score,
-                            })
-                    
-                    # If we found results in the target channel, prioritize them
-                    if target_channel and any(r["channel"].lower() == target_channel for r in latest_results):
-                        break
-                        
-                except SlackApiError as e:
-                    logger.warning(f"Failed to fetch from {channel_id}: {e}")
-                    continue
-            
-            # Sort by relevance and timestamp
-            latest_results.sort(key=lambda x: (-x.get("relevance_score", 0), -float(x.get("ts", "0"))))
-            
-            # Clean up and return
-            for result in latest_results:
-                result.pop("relevance_score", None)
-            
-            return latest_results[:max(1, int(limit or 1))]
-
+            return results
+        
         # Build optimized search query
         search_terms = []
         
-        # Prioritize priority_terms for exact matching
         if priority_terms:
             if search_strategy == "exact_match":
-                # Use quotes for exact phrase matching
                 search_terms.extend([f'"{term}"' for term in priority_terms])
             else:
                 search_terms.extend(priority_terms)
         
-        # Add keywords
         if keywords:
-            # Remove duplicates already in priority_terms
             unique_keywords = [kw for kw in keywords if kw not in priority_terms]
-            search_terms.extend(unique_keywords[:5])  # Limit keywords to avoid query overload
+            search_terms.extend(unique_keywords[:5])
         
-        # If no terms, use original query
-        if not search_terms:
-            search_query = user_query
-        else:
-            search_query = " ".join(search_terms)
+        search_query = " ".join(search_terms) if search_terms else user_query
         
-        # Add time constraints (only if not "all")
-        if time_range == "recent":
-            search_query += " after:1d"
-        elif time_range == "7d":
-            search_query += " after:7d"
-        elif time_range == "30d":
-            search_query += " after:30d"
-        elif time_range == "90d":
-            search_query += " after:90d"
-        # For "all" time_range, don't add any time constraints
+        # Add time constraints if not 'all'
+        time_constraint = ""
+        if time_range != "all":
+            if time_range == "recent":
+                time_constraint = " after:1d"
+            elif time_range == "7d":
+                time_constraint = " after:7d"
+            elif time_range == "30d":
+                time_constraint = " after:30d"
+            elif time_range == "90d":
+                time_constraint = " after:90d"
         
-        logger.info(f"Optimized Slack query: {search_query}")
-        logger.info(f"Search strategy: {search_strategy}")
-        logger.info(f"Searching {len(channel_ids)} channels")
+        search_query_with_time = search_query + time_constraint
         
-        # Log channel names for debugging
-        channel_names = []
-        for cid in channel_ids[:10]:  # Log first 10 channels
-            try:
-                info = client.conversations_info(channel=cid)
-                ch_data = info.get("channel", {})
-                channel_names.append(ch_data.get("name", cid))
-            except Exception:
-                channel_names.append(cid)
-        logger.info(f"Sample channels being searched: {channel_names}")
+        logger.info(f"Optimized Slack query with time: {search_query_with_time}")
+        logger.info(f"Searching {len(channel_ids)} channels with strategy: {search_strategy}")
         
-        # Try search API first
+        # Try search API first with time constraint if applicable
         all_results = []
         
         try:
-            resp = client.search_messages(query=search_query, count=limit * 3)
+            resp = client.search_messages(query=search_query_with_time, count=limit * 3)
             messages = resp.get("messages", {})
             matches = messages.get("matches", [])
             
-            logger.info(f"Search API found {len(matches)} total matches for query: {search_query}")
+            logger.info(f"Search API (with time) found {len(matches)} matches")
             
             for item in matches:
                 channel_info = item.get("channel", {})
                 channel_id = channel_info.get("id", "")
-                channel_name = channel_info.get("name", "unknown")
                 
-                # Log all matches for debugging
-                logger.debug(f"Found match in channel {channel_name} ({channel_id}): {item.get('text', '')[:100]}...")
-                
-                # Filter to accessible channels
                 if channel_id in channel_ids:
                     text = item.get("text", "")
                     
-                    # Calculate relevance with our enhanced scoring
                     relevance_score = calculate_message_relevance(
                         text, keywords, priority_terms, search_strategy
                     )
                     
-                    logger.debug(f"Relevance score for '{text[:50]}...': {relevance_score}")
-                    
-                    # Skip low relevance results for exact_match strategy
                     if search_strategy == "exact_match" and relevance_score < 20:
-                        logger.debug(f"Skipping low relevance result: {relevance_score}")
                         continue
                     
+                    channel_name = channel_info.get("name", "unknown")
                     ts = item.get("ts") or (item.get("message", {}) or {}).get("ts")
                     permalink = item.get("permalink")
-                    
-                    username = item.get("username")
-                    if not username:
-                        username = _resolve_username(client, item.get("user"), user_cache)
+                    username = item.get("username") or _resolve_username(client, item.get("user"))
                     
                     all_results.append({
                         "text": text,
@@ -666,40 +669,83 @@ def search_slack_optimized(
                         "permalink": permalink,
                         "relevance_score": relevance_score
                     })
-                else:
-                    logger.debug(f"Channel {channel_name} ({channel_id}) not in accessible channels list")
             
-            logger.info(f"Search API returned {len(all_results)} relevant results after filtering")
+            logger.info(f"Search API (with time) returned {len(all_results)} relevant results")
             
         except SlackApiError as e:
-            logger.warning(f"Search API failed, using recent messages: {e}")
-            # Fallback to recent messages
-            # Determine max_age_hours based on time_range
-            if time_range == "all":
-                max_age_hours = 0  # Search all history
-            elif time_range == "recent":
-                max_age_hours = 24  # 1 day
-            elif time_range == "7d":
-                max_age_hours = 168  # 7 days
-            elif time_range == "30d":
-                max_age_hours = 720  # 30 days
-            elif time_range == "90d":
-                max_age_hours = 2160  # 90 days
-            else:
-                max_age_hours = 168  # Default to 7 days
+            logger.warning(f"Search API (with time) failed: {e}")
+        
+        # If insufficient results and time constraint was applied, try without time constraint
+        if len(all_results) < min_results_threshold and time_constraint:
+            logger.info("Insufficient results with time constraint, trying without")
+            try:
+                resp = client.search_messages(query=search_query, count=limit * 3)
+                messages = resp.get("messages", {})
+                matches = messages.get("matches", [])
+                
+                logger.info(f"Search API (without time) found {len(matches)} matches")
+                
+                for item in matches:
+                    channel_info = item.get("channel", {})
+                    channel_id = channel_info.get("id", "")
+                    
+                    if channel_id in channel_ids:
+                        text = item.get("text", "")
+                        
+                        relevance_score = calculate_message_relevance(
+                            text, keywords, priority_terms, search_strategy
+                        )
+                        
+                        if search_strategy == "exact_match" and relevance_score < 20:
+                            continue
+                        
+                        channel_name = channel_info.get("name", "unknown")
+                        ts = item.get("ts") or (item.get("message", {}) or {}).get("ts")
+                        permalink = item.get("permalink")
+                        username = item.get("username") or _resolve_username(client, item.get("user"))
+                        
+                        all_results.append({
+                            "text": text,
+                            "username": username,
+                            "channel": channel_name,
+                            "ts": ts,
+                            "permalink": permalink,
+                            "relevance_score": relevance_score
+                        })
+                
+                logger.info(f"Search API (without time) returned {len(all_results)} relevant results")
+                
+            except SlackApiError as e:
+                logger.warning(f"Search API (without time) failed: {e}")
+        
+        # Final fallback: If still no results, do manual recent search
+        if len(all_results) == 0:
+            logger.info("No results from search API, falling back to manual recent search")
+            max_age_hours_map = {
+                "all": 0,
+                "recent": 24,
+                "7d": 168,
+                "30d": 720,
+                "90d": 2160
+            }
+            max_age_hours = max_age_hours_map.get(time_range, 168)
             
-            # Use all accessible channels for fallback search
-            fallback_channels = "all" if channels == "all" else (channels if isinstance(channels, str) else "")
-            all_results = search_slack_recent(
-                fallback_channels,
+            manual_results = search_slack_recent(
+                "",
                 user_query,
-                limit * 3,  # Increased multiplier
+                limit * 3,
                 max_age_hours,
                 keywords,
                 priority_terms,
                 search_strategy
             )
-            logger.info(f"Fallback search returned {len(all_results)} results")
+            
+            # Convert manual results to same format
+            for m in manual_results:
+                m["relevance_score"] = calculate_message_relevance(
+                    m["text"], keywords, priority_terms, search_strategy
+                )
+            all_results.extend(manual_results)
         
         # Sort by relevance and recency
         if all_results:

@@ -291,7 +291,7 @@ IMPORTANT INSTRUCTIONS:
 3. For conceptual queries, allow fuzzy matching
 4. Set priority_terms for MUST-MATCH keywords (version numbers, product names, specific topics)
 5. If query mentions specific channels/spaces, extract them
-6. Detect if this is asking about "latest" or "recent" content vs searching historical content
+6. Detect if this is asking about "latest" or "recent" content vs searching historical content. For recent, use "recent" time_range. For historical, use "all".
 7. For follow-up questions, keep limit low (5-10) since context already exists
 
 Intent Types:

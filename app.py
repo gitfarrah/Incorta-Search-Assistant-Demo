@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import List
 from datetime import datetime
 
@@ -103,35 +103,35 @@ def _render_sources(slack_messages: List[dict], confluence_pages: List[dict]) ->
         if not confluence_pages:
             st.info("No Confluence results found.")
         else:
-             for idx, p in enumerate(confluence_pages, 1):
-                 title = p.get('title', 'Untitled')
-                 space = p.get('space', 'Unknown')
-                 last_modified = p.get('last_modified', 'Unknown')
-                 excerpt = (p.get('excerpt') or '').strip()
-                 url = p.get('url', '')
-                 
-                 # Clean up excerpt by removing HTML highlighting tags and truncating intelligently
-                 import re
-                 cleaned_excerpt = re.sub(r'@@@hl@@@(.*?)@@@endhl@@@', r'\1', excerpt)
-                 cleaned_excerpt = re.sub(r'<[^>]+>', '', cleaned_excerpt)  # Remove any remaining HTML tags
-                 cleaned_excerpt = cleaned_excerpt.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-                 
-                 # Truncate to reasonable length and add ellipsis
-                 if len(cleaned_excerpt) > 200:
-                     cleaned_excerpt = cleaned_excerpt[:200].rsplit(' ', 1)[0] + '...'
-                 
-                 # Create a clean card-like display for each page
-                 st.markdown(f"""
-                 <div style="background-color: #f0f2f6; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #6B46C1;">
-                     <div style="font-weight: 600; color: #1f1f1f; font-size: 1.1em; margin-bottom: 8px;">{title}</div>
-                     <div style="display: flex; gap: 15px; margin-bottom: 10px; font-size: 0.9em;">
-                         <span style="color: #6B46C1; font-weight: 500;">{space}</span>
-                         <span style="color: #666;">{last_modified}</span>
-                     </div>
-                     <div style="color: #444; line-height: 1.6; margin-bottom: 10px; font-style: italic;">{cleaned_excerpt}</div>
-                     <a href="{url}" target="_blank" style="color: #6B46C1; text-decoration: none; font-size: 0.9em;">Open Page</a>
-                 </div>
-                 """, unsafe_allow_html=True)
+            for idx, p in enumerate(confluence_pages, 1):
+                title = p.get('title', 'Untitled')
+                space = p.get('space', 'Unknown')
+                last_modified = p.get('last_modified', 'Unknown')
+                excerpt = (p.get('excerpt') or '').strip()
+                url = p.get('url', '')
+                
+                # Clean up excerpt by removing HTML highlighting tags and truncating intelligently
+                import re
+                cleaned_excerpt = re.sub(r'@@@hl@@@(.*?)@@@endhl@@@', r'\1', excerpt)
+                cleaned_excerpt = re.sub(r'<[^>]+>', '', cleaned_excerpt)  # Remove any remaining HTML tags
+                cleaned_excerpt = cleaned_excerpt.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                
+                # Truncate to reasonable length and add ellipsis
+                if len(cleaned_excerpt) > 200:
+                    cleaned_excerpt = cleaned_excerpt[:200].rsplit(' ', 1)[0] + '...'
+                
+                # Create a clean card-like display for each page
+                st.markdown(f"""
+                <div style="background-color: #f0f2f6; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #6B46C1;">
+                    <div style="font-weight: 600; color: #1f1f1f; font-size: 1.1em; margin-bottom: 8px;">{title}</div>
+                    <div style="display: flex; gap: 15px; margin-bottom: 10px; font-size: 0.9em;">
+                        <span style="color: #6B46C1; font-weight: 500;">{space}</span>
+                        <span style="color: #666;">{last_modified}</span>
+                    </div>
+                    <div style="color: #444; line-height: 1.6; margin-bottom: 10px; font-style: italic;">{cleaned_excerpt}</div>
+                    <a href="{url}" target="_blank" style="color: #6B46C1; text-decoration: none; font-size: 0.9em;">Open Page</a>
+                </div>
+                """, unsafe_allow_html=True)
 
 
 def main() -> None:
@@ -168,8 +168,6 @@ def main() -> None:
         # Context refresh is always enabled (UI control removed)
         auto_refresh = True
         
-        
-
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = [
             {"role": "assistant", "content": "Hi! Ask me anything. I'll search Slack and Confluence, then summarize with sources."}
