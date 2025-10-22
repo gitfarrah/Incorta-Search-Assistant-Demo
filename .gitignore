@@ -6,3 +6,11 @@ __pycache__/
 .DS_Store
 .streamlit/
 .streamlit/secrets.toml
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
