@@ -10,7 +10,7 @@ import streamlit as st
 
 from confluence_search import search_confluence, search_confluence_optimized
 from gemini_handler import ask_gemini
-from slack_search import search_slack, search_slack_recent, search_slack_optimized
+from simplified_slack_search import search_slack_simplified
 from intent_analyzer import analyze_user_intent, validate_intent
 from cache_manager import (
     cache_intent_analysis, get_cached_intent_analysis,
@@ -81,7 +81,7 @@ def _render_sources(slack_messages: List[dict], confluence_pages: List[dict]) ->
             for idx, m in enumerate(slack_messages, 1):
                 channel = m.get('channel', 'Unknown')
                 username = m.get('username', 'Unknown')
-                timestamp = m.get('ts', '')
+                timestamp = m.get('date', m.get('ts', ''))
                 text = m.get('text', '').strip()
                 permalink = m.get('permalink', '')
                 
@@ -104,9 +104,32 @@ def _render_sources(slack_messages: List[dict], confluence_pages: List[dict]) ->
             st.info("No Confluence results found.")
         else:
             for idx, p in enumerate(confluence_pages, 1):
-                title = p.get('title', 'Untitled')
-                space = p.get('space', 'Unknown')
-                last_modified = p.get('last_modified', 'Unknown')
+                # Debug: Log the raw page data to understand structure
+                logger.debug(f"Confluence page data: {p}")
+                
+                # Improved title extraction with multiple fallbacks
+                title = (p.get('title') or 
+                        p.get('name') or 
+                        p.get('displayTitle') or 
+                        p.get('pageTitle') or 
+                        'Untitled')
+                
+                # Improved space extraction with multiple fallbacks
+                space = (p.get('space') or 
+                        p.get('space_name') or 
+                        p.get('spaceName') or 
+                        p.get('spaceKey') or 
+                        'Unknown')
+                
+                # Improved last modified extraction with multiple fallbacks
+                last_modified = (p.get('last_modified') or 
+                               p.get('lastModified') or 
+                               p.get('lastUpdated') or 
+                               p.get('modified') or 
+                               'Unknown')
+                
+                # Debug: Log extracted values
+                logger.debug(f"Extracted - Title: '{title}', Space: '{space}', Last Modified: '{last_modified}'")
                 excerpt = (p.get('excerpt') or '').strip()
                 url = p.get('url', '')
                 
@@ -155,10 +178,8 @@ def main() -> None:
         
         st.divider()
         
-        # Filters
+        # Filters (simplified - no time restrictions)
         st.subheader("Filters")
-        date_from = st.date_input("From date", value=st.session_state.get("date_from"), key="date_from")
-        date_to = st.date_input("To date", value=st.session_state.get("date_to"), key="date_to")
         channel_hint = st.text_input("Slack channel", value=st.session_state.get("channel_hint", ""), 
                                      key="channel_hint", placeholder="e.g., general, engineering")
         space_hint = st.text_input("Confluence space", value=st.session_state.get("space_hint", ""), 
@@ -191,6 +212,7 @@ def main() -> None:
     user_input = st.chat_input("Type your question")
 
     if user_input:
+        # This is a new search request
         # Echo user message
         st.session_state["chat_messages"].append({"role": "user", "content": user_input})
         with st.chat_message("user"):
@@ -201,10 +223,10 @@ def main() -> None:
             current_filters = {
                 "channel_hint": (channel_hint or "").strip(),
                 "space_hint": (space_hint or "").strip(),
-                "date_from": date_from,
-                "date_to": date_to,
             }
-            filters_changed = current_filters != st.session_state.get("filters", {})
+            stored_filters = st.session_state.get("filters", {})
+            filters_changed = current_filters != stored_filters
+            logger.info(f"Filter comparison: current={current_filters}, stored={stored_filters}, changed={filters_changed}")
 
             # Don't reuse context for latest_message intent to ensure fresh data
             intent_type = ""
@@ -212,19 +234,19 @@ def main() -> None:
                 intent_type = st.session_state["intent_data"].get("intent", "")
             
             reuse_context = (not auto_refresh) and (not filters_changed) and bool(st.session_state.get("context")) and (intent_type != "latest_message")
+            logger.info(f"reuse_context logic: {reuse_context} (auto_refresh={auto_refresh}, filters_changed={filters_changed}, has_context={bool(st.session_state.get('context'))}, intent_type={intent_type})")
 
             if reuse_context:
                 context = st.session_state.get("context") or ""
                 slack_results = st.session_state.get("slack_results") or []
                 conf_results = st.session_state.get("conf_results") or []
+                logger.info(f"Reusing context: {len(slack_results)} Slack, {len(conf_results)} Confluence results")
             else:
                 with st.spinner("Analyzing query and retrieving sources..."):
                     # Step 1: Check cache for intent analysis
                     cache_filters = {
                         "channel_hint": (channel_hint or "").strip(),
                         "space_hint": (space_hint or "").strip(),
-                        "date_from": date_from,
-                        "date_to": date_to,
                     }
                     
                     intent_data = get_cached_intent_analysis(user_input, cache_filters)
@@ -240,10 +262,6 @@ def main() -> None:
                         intent_data["slack_params"]["channels"] = channel_hint.strip()
                     if space_hint and space_hint.strip():
                         intent_data["confluence_params"]["spaces"] = space_hint.strip()
-                    if date_from:
-                        intent_data["slack_params"]["date_from"] = date_from.strftime("%Y-%m-%d")
-                    if date_to:
-                        intent_data["slack_params"]["date_to"] = date_to.strftime("%Y-%m-%d")
 
                     # Normalize Slack channel parameter if AI returned a placeholder or empty
                     try:
@@ -308,9 +326,10 @@ def main() -> None:
                             # Submit Slack search if needed
                             if "slack" in data_sources:
                                 futures["slack"] = pool.submit(
-                                    search_slack_optimized,
+                                    search_slack_simplified,
+                                    user_input,
                                     intent_data,
-                                    user_input
+                                    15  # TOP 15 limit for UI as per new specification
                                 )
                             
                             # Submit Confluence search if needed
@@ -359,11 +378,32 @@ def main() -> None:
                         except Exception as e:
                             logger.debug(f"Skipping cache of search results: {e}")
 
+                    # Only show "no results" if both sources failed completely
                     if not slack_results and not conf_results:
                         nores = "No results found in Slack or Confluence. Try adjusting your query or filters."
                         st.write(nores)
                         st.session_state["chat_messages"].append({"role": "assistant", "content": nores})
                         return
+                    
+                    # Log results for debugging
+                    logger.info(f"Search completed - Slack: {len(slack_results)} results, Confluence: {len(conf_results)} results")
+                    
+                    # Debug: Show what we found
+                    if slack_results:
+                        logger.info(f"Slack results sample: {slack_results[:2]}")
+                    if conf_results:
+                        logger.info(f"Confluence results sample: {conf_results[:2]}")
+                    
+                    # If no results, show debug info and try fallback
+                    if not slack_results and not conf_results:
+                        logger.warning(f"No results found for query: '{user_input}'")
+                        logger.warning(f"Intent data: {intent_data}")
+                        logger.warning(f"Data sources: {intent_data.get('data_sources', [])}")
+                        logger.warning(f"Slack params: {intent_data.get('slack_params', {})}")
+                        logger.warning(f"Confluence params: {intent_data.get('confluence_params', {})}")
+                        
+                        # Don't try fallback to original search method to avoid rate limits
+                        logger.info("Skipping fallback to original search method to avoid rate limits")
 
                     context = _format_context(slack_results, conf_results)
                     # Persist fresh context/results and filters
@@ -372,6 +412,10 @@ def main() -> None:
                     st.session_state["conf_results"] = conf_results
                     st.session_state["filters"] = current_filters
                     st.session_state["intent_data"] = intent_data
+                    
+                    # Reset pagination counters for new search
+                    st.session_state["slack_page"] = 0
+                    st.session_state["conf_page"] = 0
 
             # Include short conversation memory for coherence
             history_lines = []
@@ -397,7 +441,8 @@ def main() -> None:
             response_placeholder.markdown(full_response)
             
             # Show expandable sources
-            _render_sources(slack_results, conf_results)
+            if slack_results or conf_results:
+                _render_sources(slack_results, conf_results)
             
             # Store response in chat history
             st.session_state["chat_messages"].append({"role": "assistant", "content": full_response})
@@ -408,8 +453,6 @@ def main() -> None:
                     "question": user_input.strip(),
                     "channel_hint": (channel_hint or "").strip() or None,
                     "space_hint": (space_hint or "").strip() or None,
-                    "date_from": date_from,
-                    "date_to": date_to,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 }
                 if not st.session_state["search_history"] or st.session_state["search_history"][0].get("question") != new_entry["question"]:
@@ -418,6 +461,7 @@ def main() -> None:
                         st.session_state["search_history"] = st.session_state["search_history"][:50]
             except Exception as e:
                 logger.warning("Failed to append to search history: %s", e)
+    
 
 
 if __name__ == "__main__":

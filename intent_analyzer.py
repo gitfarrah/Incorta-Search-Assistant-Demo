@@ -162,7 +162,8 @@ def detect_query_type(
         r'\b(find|search|look|show|get|fetch)\b',
         r'\b(what is|what are|tell me about|information on)\b.*\b(?!that|those|it|them)\b',
         r'\b(in #?\w+|from #?\w+)\b',  # Mentions specific channel
-        r'\b(update[sd]?|announcement[s]?|change[s]?)\b',
+        r'\b(update[sd]?|announcement[s]?|change[s]?|release[s]?)\b',
+        r'\b(announcement|announce|release|version|update)\b',  # Release-related terms
     ]
     
     is_follow_up = any(re.search(pattern, query_lower) for pattern in follow_up_patterns)
@@ -228,7 +229,7 @@ def analyze_user_intent(
             "data_sources": [],
             "slack_params": {
                 "channels": "all",
-                "time_range": "30d",
+                "time_range": "all",
                 "keywords": smart_keywords,
                 "sort": "relevance",
                 "limit": 5
@@ -268,7 +269,7 @@ Analyze this query and return a JSON response with the following structure:
     "data_sources": ["slack", "confluence"],
     "slack_params": {{
         "channels": "all|specific_channel_name|list_of_channels",
-        "time_range": "recent|7d|30d|90d|all",
+        "time_range": "all",
         "keywords": ["use smart keywords + add important domain terms"],
         "sort": "relevance|timestamp",
         "limit": number,
@@ -291,7 +292,7 @@ IMPORTANT INSTRUCTIONS:
 3. For conceptual queries, allow fuzzy matching
 4. Set priority_terms for MUST-MATCH keywords (version numbers, product names, specific topics)
 5. If query mentions specific channels/spaces, extract them
-6. Detect if this is asking about "latest" or "recent" content vs searching historical content. For recent, use "recent" time_range. For historical, use "all".
+6. Search ALL available history - never miss the right answer because it's old.
 7. For follow-up questions, keep limit low (5-10) since context already exists
 
 Intent Types:
@@ -308,9 +309,11 @@ Search Strategies:
 - "semantic_search": For complex questions requiring understanding
 
 Examples:
-- "What is the latest in engineering?" → intent: "latest_message", channels: "engineering", time_range: "recent"
+- "What is the latest in engineering?" → intent: "latest_message", channels: "engineering", time_range: "all"
 - "Find info about version 2024.1.2" → priority_terms: ["2024.1.2"], search_strategy: "exact_match"
 - "Incorta MCO architecture?" → keywords: ["incorta", "mco", "architecture"], mixed_search
+- "latest release announcement" → intent: "latest_message", keywords: ["latest", "release", "announcement"], priority_terms: ["release", "announcement"]
+- "Search in Slack for the delivery date of Incorta release 25.7.2" → intent: "specific_info", keywords: ["delivery", "date", "incorta", "release", "25.7.2"], priority_terms: ["25.7.2", "delivery", "date", "release"]
 - "Tell me more about that" → intent: "follow_up", needs_fresh_data: false
 
 Return ONLY the JSON response.
@@ -370,13 +373,13 @@ def _get_default_intent() -> Dict[str, Any]:
             "time_range": "all",  # No time restrictions - search all available history
             "keywords": [],
             "sort": "relevance",
-            "limit": 25,  # Increased limit for comprehensive results
+            "limit": 25,  # Increased limit for better Slack coverage
             "priority_terms": []
         },
         "confluence_params": {
             "keywords": [],
             "spaces": "all",  # Search ALL spaces, not just None
-            "limit": 15,  # Increased limit for comprehensive results
+            "limit": 10,  # Reduced limit to give more weight to Slack
             "priority_terms": []
         },
         "search_strategy": "fuzzy_match",

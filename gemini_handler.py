@@ -100,10 +100,12 @@ This is a NEW question requiring fresh information from the sources.
 
 IMPORTANT INSTRUCTIONS:
 - Analyze the provided context carefully
-- Cite sources inline like [Slack: #channel @user, timestamp] or [Confluence: Page Title]
+- Do NOT include inline citations within sentences
+- Do NOT include a Sources section at the end
 - Synthesize information from multiple sources when relevant
 - If context is insufficient, clearly state what's missing
 - Distinguish between what the sources say and general knowledge
+- Write clean, readable text without citation clutter
 """
     
     prompt = f"""{instructions}
@@ -120,20 +122,17 @@ RESPONSE GUIDELINES:
 3. Use "Here's a breakdown based on the provided context:" as a transition
 4. Present key points with bold headings and bullet points
 5. Do NOT include inline citations within sentences
-6. At the end, add a "Sources:" section with all citations
+6. Do NOT include a Sources section at the end
+7. Write clean, readable text without citation clutter
 
 Response Structure:
 - Brief introductory paragraph (2-3 sentences)
 - "Here's a breakdown based on the provided context:"
-- **Bold Heading:** Description [Citation]
-- **Bold Heading:** Description [Citation]
+- **Bold Heading:** Description
+- **Bold Heading:** Description
 - Continue with additional points as needed
 - End with suggestions for follow-up questions
-- Sources section at the very end
-
-Citation format (only at the end in Sources section):
-- Slack: [#channel-name | @username | timestamp]
-- Confluence: [Space: Page Title | Last modified: date]
+- NO Sources section
 
 Tone:
 - Professional, descriptive, and engaging

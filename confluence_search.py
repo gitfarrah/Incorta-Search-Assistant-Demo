@@ -80,15 +80,39 @@ def search_confluence(query: str, max_results: int = 10, space_key: Optional[str
                         # Extract title
                         title = content.get("title", "Untitled")
                         
-                        # Extract space
-                        space_data = content.get("space", {})
-                        space_name = space_data.get("name", "Unknown") if isinstance(space_data, dict) else "Unknown"
-                        
-                        # Extract URL
+                        # Extract URL first (needed for space extraction)
                         base_url = (st.secrets.get("CONFLUENCE_URL", "") or "").rstrip("/")
                         links = content.get("_links", {})
                         webui = links.get("webui", "")
                         url = f"{base_url}{webui}" if base_url and webui else ""
+                        
+                        # Extract space - try multiple approaches
+                        space_name = "Unknown"
+                        space_data = content.get("space", {})
+                        
+                        if isinstance(space_data, dict):
+                            space_name = space_data.get("name") or space_data.get("key") or "Unknown"
+                        elif isinstance(space_data, str):
+                            space_name = space_data
+                        
+                        # If still unknown, try to get space info from space key
+                        if space_name == "Unknown":
+                            space_key = content.get("space", {}).get("key") if isinstance(content.get("space"), dict) else content.get("space")
+                            if space_key:
+                                try:
+                                    space_info = client.get_space(space_key)
+                                    space_name = space_info.get("name", space_key)
+                                except Exception as e:
+                                    logger.debug(f"Could not fetch space info for {space_key}: {e}")
+                                    space_name = space_key
+                        
+                        # If still unknown, try to extract from URL
+                        if space_name == "Unknown" and url:
+                            # Extract space from URL like /wiki/spaces/INC/pages/...
+                            import re
+                            space_match = re.search(r'/wiki/spaces/([^/]+)/', url)
+                            if space_match:
+                                space_name = space_match.group(1)
                         
                         # Extract excerpt
                         excerpt = item.get("excerpt", "") or content.get("excerpt", "")
