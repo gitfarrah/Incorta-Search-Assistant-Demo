@@ -453,6 +453,79 @@ class ChannelIntelligence:
             self.initialize()
         return self._channels.get(channel_id)
     
+    def get_channel_id_by_name(self, channel_name: str) -> Optional[str]:
+        """
+        Find a channel ID by channel name (case-insensitive).
+        
+        Args:
+            channel_name: The name of the channel to find (with or without #)
+        
+        Returns:
+            The channel ID if found, None otherwise
+        """
+        if not self._initialized:
+            self.initialize()
+        
+        # Remove # prefix if present
+        search_name = channel_name.lstrip('#').lower().strip()
+        
+        # Search for exact match first
+        for channel_id, channel_info in self._channels.items():
+            if channel_info.name.lower() == search_name:
+                return channel_id
+        
+        # If no exact match, try partial match
+        for channel_id, channel_info in self._channels.items():
+            if search_name in channel_info.name.lower():
+                return channel_id
+        
+        return None
+    
+    def find_similar_channels(self, channel_name: str, max_suggestions: int = 5) -> List[str]:
+        """
+        Find channels with similar names to the given channel name.
+        
+        Args:
+            channel_name: The channel name to search for (with or without #)
+            max_suggestions: Maximum number of suggestions to return
+        
+        Returns:
+            List of similar channel names (without # prefix)
+        """
+        if not self._initialized:
+            self.initialize()
+        
+        search_name = channel_name.lstrip('#').lower().strip()
+        suggestions = []
+        
+        # Find channels containing any word from the search term
+        search_words = search_name.split('_')
+        
+        for channel_id, channel_info in self._channels.items():
+            channel_lower = channel_info.name.lower()
+            
+            # Calculate similarity score
+            score = 0
+            
+            # Exact match (shouldn't happen if this is called, but just in case)
+            if channel_lower == search_name:
+                score = 100
+            # Partial match
+            elif search_name in channel_lower:
+                score = 80
+            # Check if any search words are in the channel name
+            else:
+                for word in search_words:
+                    if word in channel_lower:
+                        score += 20
+            
+            if score > 0:
+                suggestions.append((channel_info.name, score))
+        
+        # Sort by score (highest first) and return top N
+        suggestions.sort(key=lambda x: x[1], reverse=True)
+        return [name for name, _ in suggestions[:max_suggestions]]
+    
     def get_patterns(self) -> List[ChannelPattern]:
         """Get all detected channel patterns."""
         if not self._initialized:

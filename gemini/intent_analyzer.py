@@ -10,15 +10,9 @@ from collections import Counter
 import google.generativeai as genai
 import streamlit as st
 
+from .gemini_config import configure_genai
+
 logger = logging.getLogger(__name__)
-
-
-def _configure_genai() -> None:
-    """Configure the Google Generative AI client from environment."""
-    api_key = st.secrets.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
-    genai.configure(api_key=api_key)
 
 
 # Enhanced stopwords including technical and common words
@@ -242,7 +236,7 @@ def analyze_user_intent(
             "reasoning": "Follow-up question detected - can use existing context"
         }
     
-    _configure_genai()
+    configure_genai()
     
     # Step 3: Build enhanced prompt with conversation context
     context_summary = ""

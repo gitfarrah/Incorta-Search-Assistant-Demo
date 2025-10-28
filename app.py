@@ -8,10 +8,10 @@ from datetime import datetime
 
 import streamlit as st
 
-from confluence_search import search_confluence, search_confluence_optimized
-from gemini_handler import ask_gemini
-from simplified_slack_search import search_slack_simplified
-from intent_analyzer import analyze_user_intent, validate_intent
+from confluence.confluence_search import search_confluence, search_confluence_optimized
+from gemini.gemini_handler import ask_gemini
+from gemini.intent_analyzer import analyze_user_intent, validate_intent
+from slack.slack_search import search_slack_simplified
 from cache_manager import (
     cache_intent_analysis, get_cached_intent_analysis,
     cache_search_results, get_cached_search_results,
@@ -45,6 +45,30 @@ def _validate_env() -> List[str]:
     return missing
 
 
+def _clean_slack_text(text: str) -> str:
+    """
+    Clean Slack formatting from text (channels, URLs, etc.).
+    Note: User mentions should already be resolved by slack_search.py before reaching here.
+    """
+    import re
+    
+    # Clean channel mentions: <#C123456|general> -> #general
+    text = re.sub(r'<#[A-Z0-9]+\|([^>]+)>', r'#\1', text)
+    
+    # Clean URLs: <http://example.com|example> -> example (http://example.com)
+    text = re.sub(r'<(https?://[^|>]+)\|([^>]+)>', r'\2 (\1)', text)
+    
+    # Clean plain URLs: <http://example.com> -> http://example.com
+    text = re.sub(r'<(https?://[^>]+)>', r'\1', text)
+    
+    # Clean any remaining special Slack formatting
+    # This is a safety net - user mentions should already be resolved
+    text = re.sub(r'<@[A-Z0-9]+\|([^>]+)>', r'@\1', text)
+    text = re.sub(r'<@([A-Z0-9]+)>', r'@unknown_user', text)
+    
+    return text
+
+
 def _format_context(slack_messages: List[dict], confluence_pages: List[dict]) -> str:
     """Create a single context string with clear headers for Gemini."""
     parts: List[str] = []
@@ -52,8 +76,12 @@ def _format_context(slack_messages: List[dict], confluence_pages: List[dict]) ->
     if slack_messages:
         parts.append("=== Slack Messages ===")
         for i, m in enumerate(slack_messages, start=1):
-            meta = f"[# {m.get('channel','?')} | @{m.get('username','?')} | ts: {m.get('ts','?')}]"
-            line = f"{i}. {meta}\n{m.get('text','').strip()}\nSource: {m.get('permalink','')}\n"
+            # Use 'date' field for timestamp (formatted as YYYY-MM-DD HH:MM:SS)
+            timestamp = m.get('date', 'Unknown date')
+            meta = f"[# {m.get('channel','?')} | @{m.get('username','?')} | {timestamp}]"
+            # Clean Slack formatting from text
+            clean_text = _clean_slack_text(m.get('text','').strip())
+            line = f"{i}. {meta}\n{clean_text}\nSource: {m.get('permalink','')}\n"
             parts.append(line)
 
     if confluence_pages:
@@ -82,8 +110,13 @@ def _render_sources(slack_messages: List[dict], confluence_pages: List[dict]) ->
                 channel = m.get('channel', 'Unknown')
                 username = m.get('username', 'Unknown')
                 timestamp = m.get('date', m.get('ts', ''))
-                text = m.get('text', '').strip()
+                # Clean Slack formatting from text before displaying
+                text = _clean_slack_text(m.get('text', '').strip())
                 permalink = m.get('permalink', '')
+                
+                # Escape HTML characters in text to prevent XSS and rendering issues
+                import html
+                text_escaped = html.escape(text)
                 
                 # Create a clean card-like display for each message
                 st.markdown(f"""
@@ -93,7 +126,7 @@ def _render_sources(slack_messages: List[dict], confluence_pages: List[dict]) ->
                         <span style="color: #666; font-size: 0.9em;">{timestamp}</span>
                     </div>
                     <div style="color: #4A90E2; font-size: 0.9em; margin-bottom: 10px;">@{username}</div>
-                    <div style="color: #1f1f1f; line-height: 1.6; margin-bottom: 10px;">{text}</div>
+                    <div style="color: #1f1f1f; line-height: 1.6; margin-bottom: 10px; white-space: pre-wrap;">{text_escaped}</div>
                     <a href="{permalink}" target="_blank" style="color: #4A90E2; text-decoration: none; font-size: 0.9em;">View in Slack</a>
                 </div>
                 """, unsafe_allow_html=True)
@@ -344,25 +377,60 @@ def main() -> None:
                             for source, future in futures.items():
                                 try:
                                     if source == "slack":
-                                        slack_results = future.result(timeout=30)
+                                        slack_results = future.result(timeout=75)  # Increased for complex multi-channel searches
                                         logger.info(f"Retrieved {len(slack_results)} Slack messages")
+                                        
+                                        # Check if user specified a channel filter and warn if it wasn't found
+                                        specified_channel = intent_data.get("slack_params", {}).get("channels", "").strip()
+                                        if specified_channel and specified_channel.lower() not in ["all", "any", "", "none"]:
+                                            # Check if any results are from the specified channel
+                                            channel_name_clean = specified_channel.lstrip('#').lower()
+                                            found_in_channel = any(
+                                                msg.get('channel_name', '').lower() == channel_name_clean or
+                                                msg.get('channel', '').lower() == channel_name_clean
+                                                for msg in slack_results
+                                            )
+                                            
+                                            if not found_in_channel and slack_results:
+                                                # Try to find similar channels
+                                                try:
+                                                    from slack.channel_intelligence import get_channel_intelligence
+                                                    intelligence = get_channel_intelligence()
+                                                    similar = intelligence.find_similar_channels(specified_channel, max_suggestions=5)
+                                                    
+                                                    warning_msg = f"⚠️ Channel '{specified_channel}' not found. Showing results from other channels instead."
+                                                    if similar:
+                                                        warning_msg += f"\n\n💡 **Did you mean:** {', '.join(['#' + s for s in similar[:3]])}?"
+                                                    
+                                                    st.warning(warning_msg)
+                                                    logger.warning(f"User-specified channel '{specified_channel}' not found. Suggestions: {similar}")
+                                                except Exception as e:
+                                                    st.warning(f"⚠️ Channel '{specified_channel}' not found. Showing results from other relevant channels instead.")
+                                                    logger.warning(f"User-specified channel '{specified_channel}' not found in results: {e}")
+                                        
                                     elif source == "confluence":
-                                        conf_results = future.result(timeout=30)
+                                        conf_results = future.result(timeout=60)  # Confluence is typically faster
                                         logger.info(f"Retrieved {len(conf_results)} Confluence pages")
                                     
                                 except Exception as e:
                                     error_msg = f"{source.title()} search failed: {str(e)}"
-                                    logger.error(error_msg)
+                                    logger.error(error_msg, exc_info=True)  # Log full stack trace
                                     
                                     # Show user-friendly error message
                                     if "timeout" in str(e).lower():
-                                        st.warning(f"{source.title()} search timed out. This might be due to high load.")
+                                        st.warning(f"⏱️ {source.title()} search timed out. This might be due to high load.")
                                     elif "permission" in str(e).lower() or "unauthorized" in str(e).lower():
-                                        st.warning(f"{source.title()} access denied. Check your permissions.")
+                                        st.warning(f"🔒 {source.title()} access denied. Check your permissions.")
                                     elif "rate limit" in str(e).lower():
-                                        st.warning(f"{source.title()} rate limit exceeded. Please wait a moment.")
+                                        st.warning(f"⚠️ {source.title()} rate limit exceeded. Please wait a moment.")
+                                    elif "token" in str(e).lower() or "invalid" in str(e).lower():
+                                        st.warning(f"🔑 {source.title()} authentication issue. Please check your API credentials.")
                                     else:
-                                        st.warning(f"{source.title()} search encountered an issue: {str(e)[:100]}...")
+                                        # Show more detailed error for debugging
+                                        error_detail = str(e)[:200] if str(e) else "Unknown error"
+                                        st.warning(f"⚠️ {source.title()} search encountered an issue: {error_detail}")
+                                        if source == "slack":
+                                            st.info("💡 Tip: Check logs for details. Slack search may require proper authentication and channel access.")
                                     
                                     if source == "slack":
                                         slack_results = []
@@ -424,28 +492,19 @@ def main() -> None:
                 history_lines.append(f"{prefix} {m['content']}")
             preface = ("Previous conversation context (use for continuity):\n" + "\n".join(history_lines) + "\n\n") if history_lines else ""
 
-            # Stream response with write_stream
-            response_placeholder = st.empty()
-            full_response = ""
-            
+            # Get answer from Gemini
             with st.spinner("Thinking..."):
                 answer = ask_gemini(context=context, question=preface + user_input)
             
-            # Stream the response character by character for better UX
-            for char in answer:
-                full_response += char
-                response_placeholder.markdown(full_response + "▌")
-                time.sleep(0.01)  # Small delay for streaming effect
-            
-            # Final response without cursor
-            response_placeholder.markdown(full_response)
+            # Display answer directly (no streaming to avoid formatting issues)
+            st.markdown(answer)
             
             # Show expandable sources
             if slack_results or conf_results:
                 _render_sources(slack_results, conf_results)
             
             # Store response in chat history
-            st.session_state["chat_messages"].append({"role": "assistant", "content": full_response})
+            st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
 
             # Save to search history (prepend)
             try:

@@ -7,16 +7,9 @@ from typing import Optional, Sequence, List, Dict
 import google.generativeai as genai
 import streamlit as st
 
+from .gemini_config import configure_genai
 
 logger = logging.getLogger(__name__)
-
-
-def _configure_genai() -> None:
-    """Configure the Google Generative AI client from environment."""
-    api_key = st.secrets.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
-    genai.configure(api_key=api_key)
 
 
 def _supported_models() -> list[str]:
@@ -55,102 +48,46 @@ def build_enhanced_prompt(
     query_type: str = "new_search"
 ) -> str:
     """
-    Build an enhanced prompt that helps Gemini understand:
-    1. Whether this is a follow-up or new question
-    2. How to use conversation history
-    3. When to cite sources vs use prior knowledge
+    Build a concise prompt that produces short, clear responses.
     """
     
     # Build conversation context
     conv_context = ""
     if conversation_history and len(conversation_history) > 1:
-        recent_conv = conversation_history[-6:]  # Last 3 exchanges
+        recent_conv = conversation_history[-4:]  # Last 2 exchanges
         conv_lines = []
         for msg in recent_conv:
             role = "User" if msg["role"] == "user" else "Assistant"
-            content = msg["content"][:200]  # Truncate long messages
+            content = msg["content"][:150]  # Truncate long messages
             conv_lines.append(f"{role}: {content}")
-        conv_context = "=== Recent Conversation ===\n" + "\n".join(conv_lines) + "\n\n"
+        conv_context = "Previous conversation:\n" + "\n".join(conv_lines) + "\n\n"
     
-    # Determine instructions based on query type
-    if query_type == "follow_up":
-        instructions = """
-This is a FOLLOW-UP question about information already provided in the conversation.
-
-IMPORTANT INSTRUCTIONS:
-- Reference and elaborate on information from your previous responses
-- You do NOT need to cite sources for information you already provided
-- Be conversational and build upon what you've already explained
-- Only use new sources from the context if they add genuinely new information
-- If the user asks for clarification, explain more clearly without re-searching
-"""
-    elif query_type == "clarification":
-        instructions = """
-This is a CLARIFICATION request about your previous response.
-
-IMPORTANT INSTRUCTIONS:
-- Explain the same information in a different way or with more detail
-- No need to cite sources again unless providing NEW information
-- Be patient and thorough in your explanation
-- Focus on making the information clearer and more accessible
-"""
-    else:  # new_search
-        instructions = """
-This is a NEW question requiring fresh information from the sources.
-
-IMPORTANT INSTRUCTIONS:
-- Analyze the provided context carefully
-- Do NOT include inline citations within sentences
-- Do NOT include a Sources section at the end
-- Synthesize information from multiple sources when relevant
-- If context is insufficient, clearly state what's missing
-- Distinguish between what the sources say and general knowledge
-- Write clean, readable text without citation clutter
-"""
+    # Simplified instructions based on query type
+    if query_type in ["follow_up", "clarification"]:
+        instructions = """Answer concisely based on our previous conversation. No need to re-cite sources."""
+    else:
+        instructions = """Answer the question directly and concisely using the provided context."""
     
     prompt = f"""{instructions}
 
-{conv_context}Current Question:
-{question}
+{conv_context}Question: {question}
 
-=== Retrieved Context (Slack and Confluence) ===
+Context from Slack and Confluence:
 {context}
 
-RESPONSE GUIDELINES:
-1. Write a comprehensive response with clear structure and formatting
-2. Start with a brief introductory paragraph
-3. Use "Here's a breakdown based on the provided context:" as a transition
-4. Present key points with bold headings and bullet points
-5. Do NOT include inline citations within sentences
-6. Do NOT include a Sources section at the end
-7. Write clean, readable text without citation clutter
+CRITICAL RULES:
+- Be brief and direct (2-4 short paragraphs maximum)
+- Start with the direct answer immediately
+- Use simple, clear language
+- No elaborate formatting or structure
+- Do NOT include inline citations, parenthetical references, or page titles in your answer
+- Do NOT add source names like "(Product Initiative: ...)" or "(MCP Server Architecture...)"
+- Present information naturally without citing which document it came from
+- If information is insufficient, state what's missing briefly
+- ALWAYS use exact dates/timestamps from the context - do NOT interpret or convert them
+- When citing Slack messages, use the exact date format provided in the context
 
-Response Structure:
-- Brief introductory paragraph (2-3 sentences)
-- "Here's a breakdown based on the provided context:"
-- **Bold Heading:** Description
-- **Bold Heading:** Description
-- Continue with additional points as needed
-- End with suggestions for follow-up questions
-- NO Sources section
-
-Tone:
-- Professional, descriptive, and engaging
-- Explain the "why" and "how" behind information
-- Include competitive advantages and strategic context when relevant
-- Acknowledge uncertainty if context is incomplete
-- Suggest follow-up questions to get more complete information
-
-If follow-up:
-- Build on previous explanation naturally
-- Reference previous points without re-citing unless adding new info
-
-Conflicts:
-- Present both sides with detailed explanation
-- Provide your assessment with reasoning
-
-Now, please answer the question. If there is any retrieved context above, do not say that no information was found. If context is sparse, explain what's missing and suggest a follow-up query or filter.
-"""
+Answer:"""
     
     return prompt
 
@@ -169,7 +106,7 @@ def ask_gemini(
     if not question or not question.strip():
         return "Please provide a non-empty question."
 
-    _configure_genai()
+    configure_genai()
 
     supported = _supported_models()
     if model_name and model_name not in supported:
@@ -187,17 +124,18 @@ def ask_gemini(
             logger.info(f"Trying Gemini model: {name}")
             model = genai.GenerativeModel(name)
             
-            # Configure generation for better responses
+            # Configure generation for concise responses
             generation_config = {
                 "temperature": 0.7,  # Balance creativity and accuracy
                 "top_p": 0.95,
                 "top_k": 40,
-                "max_output_tokens": 2048,
+                "max_output_tokens": 800,  # Reduced for concise responses
             }
             
-            # For follow-ups, be more conversational
+            # For follow-ups, be more conversational but still concise
             if query_type in ["follow_up", "clarification"]:
                 generation_config["temperature"] = 0.8
+                generation_config["max_output_tokens"] = 600  # Even shorter for follow-ups
             
             for attempt in range(2):  # Allow one retry
                 try:
