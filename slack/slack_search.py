@@ -1308,9 +1308,10 @@ def search_slack_simplified(
                 client = _get_slack_client()
                 
                 # Fetch latest messages from this channel only
+                # Note: Slack returns messages in reverse chronological order (newest first)
                 response = client.conversations_history(
                     channel=channel_id,
-                    limit=10  # Get latest 10 messages
+                    limit=5  # Get latest 5 messages (in case some are system messages)
                 )
                 
                 messages = response.get("messages", [])
@@ -1318,36 +1319,58 @@ def search_slack_simplified(
                 if messages:
                     logger.info(f"✓ Fast path found {len(messages)} latest messages")
                     
-                    # Format results
+                    # Format results - filter out system messages and return only the LATEST real message
                     results = []
                     for msg in messages:
+                        # Skip system messages (they're not real user messages)
+                        if msg.get("subtype") in ["channel_join", "channel_leave", "channel_topic", "channel_purpose", "bot_message"]:
+                            continue
+                        
+                        # Skip messages without text
+                        if not msg.get("text"):
+                            continue
+                        
                         # Resolve user ID to username
                         user_id = msg.get("user", "")
                         username = _resolve_username(client, user_id) if user_id else "Unknown"
                         
+                        # Convert timestamp to readable format first
+                        ts = msg.get("ts", "")
+                        date_str = "Unknown"
+                        if ts:
+                            try:
+                                ts_float = float(ts)
+                                from datetime import datetime
+                                dt = datetime.fromtimestamp(ts_float)
+                                date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                            except:
+                                date_str = "Unknown"
+                        
+                        # Generate permalink (conversations_history doesn't include it)
+                        permalink = ""
+                        if ts and channel_id:
+                            # Remove the decimal point from timestamp for permalink
+                            ts_for_link = ts.replace(".", "")
+                            permalink = f"https://incorta-group.slack.com/archives/{channel_id}/p{ts_for_link}"
+                        
                         result = {
                             "text": msg.get("text", ""),
+                            "channel": specific_channel.lstrip('#'),  # UI expects 'channel' field
                             "channel_id": channel_id,
-                            "channel_name": specific_channel.lstrip('#'),  # Remove # for consistency
-                            "timestamp": msg.get("ts", ""),
+                            "timestamp": ts,
+                            "ts": ts,  # Keep for compatibility
+                            "date": date_str,  # UI expects 'date' field
                             "user": user_id,
-                            "username": username,  # Add resolved username
-                            "permalink": msg.get("permalink", ""),
+                            "username": username,  # Resolved username
+                            "permalink": permalink,
                             "score": 100.0,  # Max relevance for exact channel match
                             "is_fast_path": True
                         }
                         
-                        # Convert timestamp to readable format
-                        if result["timestamp"]:
-                            try:
-                                ts_float = float(result["timestamp"])
-                                from datetime import datetime
-                                dt = datetime.fromtimestamp(ts_float)
-                                result["datetime"] = dt.strftime("%Y-%m-%d %H:%M:%S")
-                            except:
-                                result["datetime"] = "Unknown"
-                        
                         results.append(result)
+                        
+                        # For "latest message" queries, only return the FIRST real message (newest)
+                        break  # Exit after finding the first real user message
                     
                     # Resolve user mentions in message text
                     results = _resolve_mentions_in_results(client, results)
